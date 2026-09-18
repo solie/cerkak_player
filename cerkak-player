@@ -1,0 +1,921 @@
+#!/usr/bin/env python3
+"""
+cerkak-player: Audio player daemon and CLI for Javanese short stories (Slamet Prasojo)
+Controls mpv via IPC socket for sound-only YouTube playback with playlist management,
+shuffle, prev/next, pause/play, volume, and custom playlist support.
+"""
+
+import os
+import sys
+import json
+import time
+import socket
+import select
+import random
+import signal
+import urllib.parse
+import subprocess
+from pathlib import Path
+
+DEFAULT_PLAYLIST_URL = "https://youtube.com/playlist?list=PLR0xzKWWUQU4TbQRIWq8sSxM_MdtlbrVO"
+DEFAULT_PLAYLIST_NAME = "Cerita Cekak Basa Jawa - Slamet Prasojo"
+
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/runtime-{os.getuid()}")) / "cerkak_sprasojo"
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "cerkak_sprasojo"
+SCRIPT_DIR = Path(__file__).resolve().parent
+BUNDLED_PLAYLIST = SCRIPT_DIR / "assets" / "default_playlist.json"
+
+MPV_SOCKET = RUNTIME_DIR / "mpv.sock"
+CONTROL_SOCKET = RUNTIME_DIR / "control.sock"
+STATUS_FILE = RUNTIME_DIR / "status.json"
+PID_FILE = RUNTIME_DIR / "player.pid"
+MPV_LOG = RUNTIME_DIR / "mpv.log"
+
+SAVED_PLAYLIST_FILE = DATA_DIR / "playlist.json"
+STATE_FILE = DATA_DIR / "state.json"
+
+
+def ensure_dirs():
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def format_duration(seconds):
+    if seconds is None or seconds < 0:
+        return "00:00"
+    s = int(seconds)
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def clean_title(title):
+    import re
+    if not title:
+        return ""
+    t = str(title).strip()
+    m = re.search(r"irah-?irahan\s*:\s*([^,.\n\r]+)", t, re.IGNORECASE)
+    if m:
+        return m.group(1).strip(" .\"'\t")
+    m = re.search(r"judul\s*:\s*([^,.\n\r]+)", t, re.IGNORECASE)
+    if m:
+        return m.group(1).strip(" .\"'\t")
+    t = re.sub(r"^(Cerkak|Cerita Cekak|Cekak)\s*[-–:]\s*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"^Basa Jawa\s*[-–:]\s*", "", t, flags=re.IGNORECASE)
+    return t.strip(" .\"'\t")
+
+
+class PlaylistManager:
+    def __init__(self):
+        self.url = DEFAULT_PLAYLIST_URL
+        self.title = DEFAULT_PLAYLIST_NAME
+        self.items = []
+        self.load()
+
+    @property
+    def is_default(self):
+        norm_cur = urllib.parse.parse_qs(urllib.parse.urlparse(self.url).query).get("list", [""])[0]
+        norm_def = urllib.parse.parse_qs(urllib.parse.urlparse(DEFAULT_PLAYLIST_URL).query).get("list", [""])[0]
+        return norm_cur == norm_def if norm_cur and norm_def else self.url == DEFAULT_PLAYLIST_URL
+
+    def load(self):
+        if SAVED_PLAYLIST_FILE.exists():
+            try:
+                with open(SAVED_PLAYLIST_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.items = data.get("items", [])
+                    self.url = data.get("playlistUrl", DEFAULT_PLAYLIST_URL)
+                    self.title = data.get("title", DEFAULT_PLAYLIST_NAME)
+                    if self.items:
+                        return
+            except Exception as err:
+                print(f"[cerkak-player] Error loading saved playlist: {err}", file=sys.stderr)
+
+        if BUNDLED_PLAYLIST.exists():
+            try:
+                with open(BUNDLED_PLAYLIST, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.items = data.get("items", [])
+                    self.url = data.get("playlistUrl", DEFAULT_PLAYLIST_URL)
+                    self.title = data.get("title", DEFAULT_PLAYLIST_NAME)
+            except Exception as err:
+                print(f"[cerkak-player] Error loading bundled playlist: {err}", file=sys.stderr)
+
+    def save(self):
+        ensure_dirs()
+        data = {
+            "title": self.title,
+            "playlistUrl": self.url,
+            "count": len(self.items),
+            "items": self.items
+        }
+        temp_file = SAVED_PLAYLIST_FILE.with_suffix(".tmp")
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        temp_file.replace(SAVED_PLAYLIST_FILE)
+
+    def reset_default(self):
+        if SAVED_PLAYLIST_FILE.exists():
+            try:
+                SAVED_PLAYLIST_FILE.unlink()
+            except Exception:
+                pass
+        self.load()
+        return True
+
+    def fetch_from_youtube(self, playlist_url):
+        url = playlist_url.strip()
+        if not url:
+            url = DEFAULT_PLAYLIST_URL
+
+        # Resolve yt-dlp binary path
+        ytdl_bin = "yt-dlp"
+        user_local = Path.home() / ".local" / "bin" / "yt-dlp"
+        if user_local.exists() and os.access(user_local, os.X_OK):
+            ytdl_bin = str(user_local)
+
+        env = os.environ.copy()
+        env["PATH"] = f"{Path.home()}/.local/bin:{env.get('PATH', '')}"
+
+        cmd = [
+            ytdl_bin,
+            "--flat-playlist",
+            "--dump-single-json",
+            "--no-warnings",
+            url
+        ]
+
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        if proc.returncode != 0:
+            raise RuntimeError(f"yt-dlp failed: {proc.stderr.strip() or 'Unknown error'}")
+
+        data = json.loads(proc.stdout)
+        raw_entries = data.get("entries", [])
+        new_items = []
+        for e in raw_entries:
+            vid_id = e.get("id")
+            title = e.get("title")
+            if not vid_id or not title or str(title).startswith("["):
+                continue
+            dur = e.get("duration") or 0
+            thumbs = e.get("thumbnails") or []
+            thumb_url = thumbs[-1]["url"] if thumbs else f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg"
+            new_items.append({
+                "id": vid_id,
+                "url": f"https://www.youtube.com/watch?v={vid_id}",
+                "title": clean_title(title),
+                "fullTitle": str(title),
+                "duration": int(dur),
+                "durationFormatted": format_duration(dur),
+                "thumbnail": thumb_url,
+                "reader": e.get("uploader") or "Slamet Prasojo"
+            })
+
+        if not new_items:
+            raise RuntimeError("No playable videos found in playlist")
+
+        self.url = url
+        self.title = data.get("title") or "YouTube Playlist"
+        self.items = new_items
+        self.save()
+        return len(new_items)
+
+
+class Daemon:
+    def __init__(self):
+        ensure_dirs()
+        self.playlist_mgr = PlaylistManager()
+        self.current_index = 0
+        self.shuffle = False
+        self.shuffled_indices = []
+        self.shuffle_pos = 0
+        self.history = []
+
+        self.mpv_proc = None
+        self.mpv_sock = None
+        self.running = True
+        self.is_playing = False
+        self.is_paused = False
+        self.position = 0.0
+        self.duration = 0.0
+        self.volume = 75
+        self.loading = False
+        self.error_msg = ""
+        self.req_id = 1
+
+        self.load_state()
+        self.rebuild_shuffle()
+
+    def load_state(self):
+        if STATE_FILE.exists():
+            try:
+                with open(STATE_FILE, "r", encoding="utf-8") as f:
+                    state = json.load(f)
+                    self.current_index = max(0, min(len(self.playlist_mgr.items) - 1, state.get("index", 0)))
+                    self.volume = max(0, min(100, state.get("volume", 75)))
+                    self.shuffle = bool(state.get("shuffle", False))
+            except Exception:
+                pass
+
+    def save_state(self):
+        ensure_dirs()
+        state = {
+            "index": self.current_index,
+            "volume": self.volume,
+            "shuffle": self.shuffle,
+            "playlistUrl": self.playlist_mgr.url
+        }
+        try:
+            temp = STATE_FILE.with_suffix(".tmp")
+            with open(temp, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+            temp.replace(STATE_FILE)
+        except Exception:
+            pass
+
+    def rebuild_shuffle(self):
+        count = len(self.playlist_mgr.items)
+        if count <= 0:
+            self.shuffled_indices = []
+            self.shuffle_pos = 0
+            return
+        indices = list(range(count))
+        random.shuffle(indices)
+        if self.current_index in indices:
+            indices.remove(self.current_index)
+            indices.insert(0, self.current_index)
+        self.shuffled_indices = indices
+        self.shuffle_pos = 0
+
+    def start_mpv(self):
+        if self.mpv_proc and self.mpv_proc.poll() is None:
+            return True
+
+        if MPV_SOCKET.exists():
+            try:
+                MPV_SOCKET.unlink()
+            except Exception:
+                pass
+
+        env = os.environ.copy()
+        env["PATH"] = f"{Path.home()}/.local/bin:{env.get('PATH', '')}"
+
+        cmd = [
+            "mpv",
+            "--idle=yes",
+            "--no-video",
+            f"--input-ipc-server={MPV_SOCKET}",
+            "--ytdl-format=bestaudio/best",
+            "--gapless-audio=yes",
+            f"--volume={self.volume}",
+            "--ao=pipewire,pulse,alsa",
+            "--force-window=no"
+        ]
+
+        log_file = open(MPV_LOG, "w")
+        self.mpv_proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            preexec_fn=os.setsid
+        )
+
+        for _ in range(50):
+            if MPV_SOCKET.exists():
+                break
+            time.sleep(0.04)
+
+        if not MPV_SOCKET.exists():
+            self.error_msg = "Could not start mpv IPC server"
+            return False
+
+        try:
+            self.mpv_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.mpv_sock.connect(str(MPV_SOCKET))
+            self.mpv_sock.setblocking(False)
+
+            # Observe properties
+            self.send_mpv_cmd(["observe_property", 1, "time-pos"])
+            self.send_mpv_cmd(["observe_property", 2, "pause"])
+            self.send_mpv_cmd(["observe_property", 3, "idle-active"])
+            self.send_mpv_cmd(["observe_property", 4, "duration"])
+            self.send_mpv_cmd(["observe_property", 5, "volume"])
+            return True
+        except Exception as err:
+            self.error_msg = f"mpv connection failed: {err}"
+            return False
+
+    def send_mpv_cmd(self, args):
+        if not self.mpv_sock:
+            return None
+        self.req_id += 1
+        msg = json.dumps({"command": args, "request_id": self.req_id}) + "\n"
+        try:
+            self.mpv_sock.sendall(msg.encode("utf-8"))
+            return self.req_id
+        except Exception as err:
+            print(f"[cerkak-player] mpv send failed: {err}", file=sys.stderr)
+            return None
+
+    def play_index(self, index):
+        if not self.playlist_mgr.items:
+            self.error_msg = "Playlist is empty"
+            self.emit_status()
+            return False
+
+        count = len(self.playlist_mgr.items)
+        idx = max(0, min(count - 1, int(index)))
+        self.current_index = idx
+        self.history.append(idx)
+        if len(self.history) > 50:
+            self.history.pop(0)
+
+        if not self.start_mpv():
+            self.emit_status()
+            return False
+
+        item = self.playlist_mgr.items[idx]
+        url = item["url"]
+
+        self.loading = True
+        self.is_playing = True
+        self.is_paused = False
+        self.position = 0.0
+        self.duration = float(item.get("duration", 0))
+        self.error_msg = ""
+        self.emit_status()
+
+        self.send_mpv_cmd(["loadfile", url, "replace"])
+        self.send_mpv_cmd(["set_property", "pause", False])
+        self.save_state()
+        return True
+
+    def play(self, target=None):
+        if target is not None and str(target).strip() != "":
+            try:
+                idx = int(target)
+                return self.play_index(idx)
+            except ValueError:
+                pass
+
+        if self.is_paused:
+            self.send_mpv_cmd(["set_property", "pause", False])
+            self.is_paused = False
+            self.is_playing = True
+            self.emit_status()
+            return True
+
+        if not self.is_playing:
+            return self.play_index(self.current_index)
+
+        return True
+
+    def pause(self):
+        if self.is_playing and not self.is_paused:
+            self.send_mpv_cmd(["set_property", "pause", True])
+            self.is_paused = True
+            self.emit_status()
+            return True
+        return False
+
+    def play_pause(self):
+        if not self.is_playing:
+            return self.play_index(self.current_index)
+        if self.is_paused:
+            return self.play()
+        return self.pause()
+
+    def stop(self):
+        if self.mpv_sock:
+            self.send_mpv_cmd(["stop"])
+        self.is_playing = False
+        self.is_paused = False
+        self.loading = False
+        self.position = 0.0
+        self.emit_status()
+        return True
+
+    def next_track(self):
+        count = len(self.playlist_mgr.items)
+        if count == 0:
+            return False
+
+        if self.shuffle:
+            if not self.shuffled_indices or self.shuffle_pos >= len(self.shuffled_indices) - 1:
+                self.rebuild_shuffle()
+                self.shuffle_pos = 0
+            else:
+                self.shuffle_pos += 1
+            next_idx = self.shuffled_indices[self.shuffle_pos]
+        else:
+            next_idx = (self.current_index + 1) % count
+
+        return self.play_index(next_idx)
+
+    def prev_track(self):
+        count = len(self.playlist_mgr.items)
+        if count == 0:
+            return False
+
+        # If playing more than 3 seconds into a track, rewind to start
+        if self.position > 3.0:
+            self.seek(0.0)
+            return True
+
+        if self.shuffle and len(self.history) >= 2:
+            self.history.pop()  # current
+            prev_idx = self.history.pop()
+        else:
+            prev_idx = (self.current_index - 1 + count) % count
+
+        return self.play_index(prev_idx)
+
+    def toggle_shuffle(self, explicit_state=None):
+        if explicit_state is not None:
+            self.shuffle = bool(explicit_state)
+        else:
+            self.shuffle = not self.shuffle
+
+        if self.shuffle:
+            self.rebuild_shuffle()
+
+        self.save_state()
+        self.emit_status()
+        return self.shuffle
+
+    def seek(self, seconds):
+        try:
+            pos = max(0.0, float(seconds))
+            self.position = pos
+            if self.mpv_sock:
+                self.send_mpv_cmd(["seek", pos, "absolute"])
+            self.emit_status()
+            return True
+        except Exception:
+            return False
+
+    def set_volume(self, vol):
+        try:
+            v = max(0, min(100, int(vol)))
+            self.volume = v
+            if self.mpv_sock:
+                self.send_mpv_cmd(["set_property", "volume", v])
+            self.save_state()
+            self.emit_status()
+            return True
+        except Exception:
+            return False
+
+    def change_playlist(self, url):
+        self.loading = True
+        self.emit_status()
+        try:
+            count = self.playlist_mgr.fetch_from_youtube(url)
+            self.current_index = 0
+            self.rebuild_shuffle()
+            self.loading = False
+            self.error_msg = ""
+            self.save_state()
+            self.emit_status()
+            return True, f"Loaded {count} stories"
+        except Exception as err:
+            self.loading = False
+            self.error_msg = str(err)
+            self.emit_status()
+            return False, str(err)
+
+    def reset_playlist(self):
+        self.playlist_mgr.reset_default()
+        self.current_index = 0
+        self.rebuild_shuffle()
+        self.error_msg = ""
+        self.save_state()
+        self.emit_status()
+        return True
+
+    def get_status_dict(self):
+        items = self.playlist_mgr.items
+        count = len(items)
+        idx = self.current_index
+        item = items[idx] if 0 <= idx < count else {}
+
+        dur = self.duration or float(item.get("duration", 0))
+        pos = self.position
+        progress = (pos / dur) if dur > 0 else 0.0
+
+        return {
+            "running": True,
+            "playing": self.is_playing,
+            "paused": self.is_paused,
+            "idle": not self.is_playing,
+            "index": idx,
+            "count": count,
+            "id": item.get("id", ""),
+            "url": item.get("url", ""),
+            "title": item.get("title", ""),
+            "fullTitle": item.get("fullTitle", ""),
+            "reader": item.get("reader", "Slamet Prasojo"),
+            "thumbnail": item.get("thumbnail", ""),
+            "duration": int(dur),
+            "position": round(pos, 1),
+            "durationFormatted": format_duration(dur),
+            "positionFormatted": format_duration(pos),
+            "progress": min(1.0, max(0.0, round(progress, 4))),
+            "volume": self.volume,
+            "shuffle": self.shuffle,
+            "playlistTitle": self.playlist_mgr.title,
+            "playlistUrl": self.playlist_mgr.url,
+            "isDefaultPlaylist": self.playlist_mgr.is_default,
+            "loading": self.loading,
+            "error": self.error_msg
+        }
+
+    def emit_status(self):
+        ensure_dirs()
+        status_data = self.get_status_dict()
+        raw = json.dumps(status_data, ensure_ascii=False)
+        try:
+            with open(STATUS_FILE, "w", encoding="utf-8") as f:
+                f.write(raw)
+        except Exception:
+            pass
+
+    def handle_mpv_event(self, line):
+        try:
+            data = json.loads(line)
+        except Exception:
+            return
+
+        event = data.get("event")
+        prop = data.get("name")
+        val = data.get("data")
+
+        if event == "property-change":
+            if prop == "time-pos" and val is not None:
+                self.position = float(val)
+                self.loading = False
+            elif prop == "pause" and val is not None:
+                self.is_paused = bool(val)
+            elif prop == "duration" and val is not None:
+                self.duration = float(val)
+            elif prop == "volume" and val is not None:
+                self.volume = int(val)
+            elif prop == "idle-active" and val is not None:
+                if val and self.is_playing and not self.loading:
+                    self.is_playing = False
+        elif event == "file-loaded":
+            self.loading = False
+            self.is_playing = True
+            self.is_paused = False
+        elif event == "end-file":
+            reason = data.get("reason")
+            if reason == "eof":
+                # Song finished naturally, go to next!
+                self.next_track()
+            elif reason == "error":
+                self.error_msg = data.get("error", "Playback error")
+                self.is_playing = False
+
+    def handle_client_cmd(self, req):
+        action = req.get("action")
+        arg = req.get("arg")
+
+        if action == "play":
+            ok = self.play(arg)
+            return {"ok": ok, "status": self.get_status_dict()}
+        elif action == "pause":
+            ok = self.pause()
+            return {"ok": ok, "status": self.get_status_dict()}
+        elif action == "play-pause":
+            ok = self.play_pause()
+            return {"ok": ok, "status": self.get_status_dict()}
+        elif action == "stop":
+            ok = self.stop()
+            return {"ok": ok, "status": self.get_status_dict()}
+        elif action == "next":
+            ok = self.next_track()
+            return {"ok": ok, "status": self.get_status_dict()}
+        elif action == "prev":
+            ok = self.prev_track()
+            return {"ok": ok, "status": self.get_status_dict()}
+        elif action == "shuffle":
+            state = None
+            if arg is not None:
+                if str(arg).lower() in ("1", "true", "on"):
+                    state = True
+                elif str(arg).lower() in ("0", "false", "off"):
+                    state = False
+            new_state = self.toggle_shuffle(state)
+            return {"ok": True, "shuffle": new_state, "status": self.get_status_dict()}
+        elif action == "seek":
+            ok = self.seek(arg)
+            return {"ok": ok, "status": self.get_status_dict()}
+        elif action == "volume":
+            ok = self.set_volume(arg)
+            return {"ok": ok, "status": self.get_status_dict()}
+        elif action == "status":
+            return {"ok": True, "status": self.get_status_dict()}
+        elif action == "list":
+            return {
+                "ok": True,
+                "title": self.playlist_mgr.title,
+                "url": self.playlist_mgr.url,
+                "count": len(self.playlist_mgr.items),
+                "items": self.playlist_mgr.items
+            }
+        elif action == "playlist":
+            if arg:
+                ok, msg = self.change_playlist(str(arg))
+                return {"ok": ok, "message": msg, "status": self.get_status_dict()}
+            else:
+                return {
+                    "ok": True,
+                    "url": self.playlist_mgr.url,
+                    "title": self.playlist_mgr.title,
+                    "count": len(self.playlist_mgr.items)
+                }
+        elif action == "refresh":
+            ok, msg = self.change_playlist(self.playlist_mgr.url)
+            return {"ok": ok, "message": msg, "status": self.get_status_dict()}
+        elif action == "reset-playlist":
+            ok = self.reset_playlist()
+            return {"ok": ok, "status": self.get_status_dict()}
+        elif action == "quit":
+            self.running = False
+            return {"ok": True, "message": "Quitting"}
+
+        return {"ok": False, "error": f"Unknown action: {action}"}
+
+    def run(self):
+        # Write PID file
+        with open(PID_FILE, "w") as f:
+            f.write(str(os.getpid()))
+
+        if CONTROL_SOCKET.exists():
+            try:
+                CONTROL_SOCKET.unlink()
+            except Exception:
+                pass
+
+        server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server_sock.bind(str(CONTROL_SOCKET))
+        server_sock.listen(16)
+        server_sock.setblocking(False)
+
+        def signal_handler(signum, frame):
+            self.running = False
+
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
+        self.emit_status()
+        mpv_buffer = ""
+        last_emit = time.time()
+
+        try:
+            while self.running:
+                # Check mpv process
+                if self.mpv_proc and self.mpv_proc.poll() is not None:
+                    self.mpv_sock = None
+                    self.is_playing = False
+                    self.is_paused = False
+
+                read_sockets = [server_sock]
+                if self.mpv_sock:
+                    read_sockets.append(self.mpv_sock)
+
+                readable, _, _ = select.select(read_sockets, [], [], 0.25)
+
+                for s in readable:
+                    if s is server_sock:
+                        try:
+                            client, _ = server_sock.accept()
+                            data = b""
+                            while True:
+                                chunk = client.recv(4096)
+                                if not chunk:
+                                    break
+                                data += chunk
+                                if b"\n" in chunk:
+                                    break
+                            if data:
+                                req = json.loads(data.decode("utf-8"))
+                                resp = self.handle_client_cmd(req)
+                                client.sendall((json.dumps(resp) + "\n").encode("utf-8"))
+                            client.close()
+                        except Exception as e:
+                            pass
+                    elif s is self.mpv_sock:
+                        try:
+                            chunk = self.mpv_sock.recv(4096).decode("utf-8")
+                            if not chunk:
+                                self.mpv_sock = None
+                            else:
+                                mpv_buffer += chunk
+                                while "\n" in mpv_buffer:
+                                    line, mpv_buffer = mpv_buffer.split("\n", 1)
+                                    line = line.strip()
+                                    if line:
+                                        self.handle_mpv_event(line)
+                        except (BlockingIOError, InterruptedError):
+                            pass
+                        except Exception:
+                            self.mpv_sock = None
+
+                now = time.time()
+                if now - last_emit >= 0.5:
+                    self.emit_status()
+                    last_emit = now
+
+        finally:
+            self.cleanup()
+
+    def cleanup(self):
+        if self.mpv_sock:
+            try:
+                self.mpv_sock.close()
+            except Exception:
+                pass
+        if self.mpv_proc and self.mpv_proc.poll() is None:
+            try:
+                self.mpv_proc.terminate()
+                self.mpv_proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    self.mpv_proc.kill()
+                except Exception:
+                    pass
+
+        if CONTROL_SOCKET.exists():
+            try:
+                CONTROL_SOCKET.unlink()
+            except Exception:
+                pass
+        if PID_FILE.exists():
+            try:
+                PID_FILE.unlink()
+            except Exception:
+                pass
+
+        # Final status: stopped
+        final_status = self.get_status_dict()
+        final_status["running"] = False
+        final_status["playing"] = False
+        final_status["paused"] = False
+        final_status["idle"] = True
+        try:
+            with open(STATUS_FILE, "w", encoding="utf-8") as f:
+                json.dump(final_status, f)
+        except Exception:
+            pass
+
+
+def is_daemon_running():
+    if not CONTROL_SOCKET.exists():
+        return False
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(str(CONTROL_SOCKET))
+        s.sendall(json.dumps({"action": "status"}).encode("utf-8") + b"\n")
+        resp = s.recv(4096)
+        s.close()
+        return bool(resp)
+    except Exception:
+        return False
+
+
+def start_daemon_background():
+    if is_daemon_running():
+        return True
+    ensure_dirs()
+    python_bin = sys.executable
+    script_path = str(Path(__file__).resolve())
+    proc = subprocess.Popen(
+        [python_bin, script_path, "daemon"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True
+    )
+    for _ in range(50):
+        if is_daemon_running():
+            return True
+        time.sleep(0.04)
+    return is_daemon_running()
+
+
+def send_command(action, arg=None):
+    if not is_daemon_running():
+        # Actions that shouldn't auto-start daemon
+        if action in ("status", "list"):
+            # Provide passive offline status
+            if action == "status" and STATUS_FILE.exists():
+                try:
+                    with open(STATUS_FILE, "r") as f:
+                        print(f.read())
+                        return 0
+                except Exception:
+                    pass
+            elif action == "list":
+                pm = PlaylistManager()
+                print(json.dumps({
+                    "ok": True,
+                    "title": pm.title,
+                    "url": pm.url,
+                    "count": len(pm.items),
+                    "items": pm.items
+                }))
+                return 0
+        # Start daemon on demand
+        if not start_daemon_background():
+            print(json.dumps({"ok": False, "error": "Could not start player daemon"}))
+            return 1
+
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(15.0)
+        s.connect(str(CONTROL_SOCKET))
+        req = {"action": action}
+        if arg is not None:
+            req["arg"] = arg
+        s.sendall(json.dumps(req).encode("utf-8") + b"\n")
+
+        data = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+            if b"\n" in chunk:
+                break
+        s.close()
+
+        if data:
+            print(data.decode("utf-8").strip())
+            return 0
+        else:
+            print(json.dumps({"ok": False, "error": "Empty response"}))
+            return 1
+    except Exception as err:
+        print(json.dumps({"ok": False, "error": str(err)}))
+        return 1
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: cerkak-player <play|pause|play-pause|stop|next|prev|shuffle|seek|volume|status|list|playlist|reset-playlist|refresh|quit>")
+        sys.exit(0)
+
+    cmd = sys.argv[1].lower()
+    arg = sys.argv[2] if len(sys.argv) > 2 else None
+
+    if cmd == "daemon":
+        d = Daemon()
+        d.run()
+        sys.exit(0)
+    elif cmd in ("play", "p"):
+        sys.exit(send_command("play", arg))
+    elif cmd == "pause":
+        sys.exit(send_command("pause"))
+    elif cmd in ("play-pause", "toggle"):
+        sys.exit(send_command("play-pause"))
+    elif cmd in ("stop", "s"):
+        sys.exit(send_command("stop"))
+    elif cmd in ("next", "n"):
+        sys.exit(send_command("next"))
+    elif cmd in ("prev", "previous"):
+        sys.exit(send_command("prev"))
+    elif cmd in ("shuffle", "shuf"):
+        sys.exit(send_command("shuffle", arg))
+    elif cmd == "seek":
+        if arg is None:
+            print(json.dumps({"ok": False, "error": "Missing seek argument (seconds)"}))
+            sys.exit(1)
+        sys.exit(send_command("seek", arg))
+    elif cmd in ("volume", "vol"):
+        if arg is None:
+            print(json.dumps({"ok": False, "error": "Missing volume argument (0-100)"}))
+            sys.exit(1)
+        sys.exit(send_command("volume", arg))
+    elif cmd == "status":
+        sys.exit(send_command("status"))
+    elif cmd == "list":
+        sys.exit(send_command("list"))
+    elif cmd == "playlist":
+        sys.exit(send_command("playlist", arg))
+    elif cmd == "reset-playlist":
+        sys.exit(send_command("reset-playlist"))
+    elif cmd == "refresh":
+        sys.exit(send_command("refresh"))
+    elif cmd == "quit":
+        sys.exit(send_command("quit"))
+    else:
+        print(json.dumps({"ok": False, "error": f"Unknown command: {cmd}"}))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

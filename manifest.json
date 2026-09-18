@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "cerkak_player",
+  "name": "Cerkak Player",
+  "version": "1.0.0",
+  "author": "Solie",
+  "license": "MIT",
+  "description": "Javanese short stories (Cerita Cekak Basa Jawa) audio player read by Slamet Prasojo. Supports YouTube playlists, shuffle, and full playback controls.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Cerkak Player",
+    "description": "Javanese short stories and YouTube playlist audio player",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
