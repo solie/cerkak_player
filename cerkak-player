@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import time
+import fcntl
 import socket
 import select
 import random
@@ -20,8 +21,8 @@ from pathlib import Path
 DEFAULT_PLAYLIST_URL = "https://youtube.com/playlist?list=PLR0xzKWWUQU4TbQRIWq8sSxM_MdtlbrVO"
 DEFAULT_PLAYLIST_NAME = "Cerita Cekak Basa Jawa - Slamet Prasojo"
 
-RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/runtime-{os.getuid()}")) / "cerkak_sprasojo"
-DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "cerkak_sprasojo"
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/runtime-{os.getuid()}")) / "cerkak_player"
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "cerkak_player"
 SCRIPT_DIR = Path(__file__).resolve().parent
 BUNDLED_PLAYLIST = SCRIPT_DIR / "assets" / "default_playlist.json"
 
@@ -537,9 +538,14 @@ class Daemon:
         ensure_dirs()
         status_data = self.get_status_dict()
         raw = json.dumps(status_data, ensure_ascii=False)
+        if raw == getattr(self, "_last_status_raw", None) and STATUS_FILE.exists():
+            return
+        self._last_status_raw = raw
         try:
-            with open(STATUS_FILE, "w", encoding="utf-8") as f:
+            tmp = STATUS_FILE.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
                 f.write(raw)
+            tmp.replace(STATUS_FILE)
         except Exception:
             pass
 
@@ -650,6 +656,13 @@ class Daemon:
         return {"ok": False, "error": f"Unknown action: {action}"}
 
     def run(self):
+        # Single-instance guard: exit if another daemon already holds the lock
+        lock_file = open(RUNTIME_DIR / "daemon.lock", "w")
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return
+
         # Write PID file
         with open(PID_FILE, "w") as f:
             f.write(str(os.getpid()))
@@ -767,8 +780,10 @@ class Daemon:
         final_status["paused"] = False
         final_status["idle"] = True
         try:
-            with open(STATUS_FILE, "w", encoding="utf-8") as f:
+            tmp = STATUS_FILE.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(final_status, f)
+            tmp.replace(STATUS_FILE)
         except Exception:
             pass
 

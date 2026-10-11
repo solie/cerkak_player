@@ -13,10 +13,10 @@ import "Model.js" as Model
 // Wheel: Adjust volume
 BarWidget {
   id: root
-  moduleName: "cerkak_sprasojo"
+  moduleName: "cerkak_player"
 
   readonly property string playerScript: Qt.resolvedUrl("cerkak-player").toString().replace(/^file:\/\//, "")
-  readonly property string statusPath: Quickshell.env("XDG_RUNTIME_DIR") + "/cerkak_sprasojo/status.json"
+  readonly property string statusPath: Quickshell.env("XDG_RUNTIME_DIR") + "/cerkak_player/status.json"
 
   property var playerState: null
   readonly property bool playerRunning: playerState && playerState.running === true
@@ -184,7 +184,7 @@ BarWidget {
   }
 
   IpcHandler {
-    target: "cerkak_sprasojo"
+    target: "cerkak_player"
 
     function play(): void { root.runAction("play") }
     function pause(): void { root.runAction("pause") }

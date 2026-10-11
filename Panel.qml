@@ -11,8 +11,8 @@ import "Model.js" as Model
 // searchable list of all 230+ stories, and custom YouTube playlist manager.
 Panel {
   id: root
-  moduleName: "cerkak_sprasojo"
-  ipcTarget: "cerkak_sprasojo"
+  moduleName: "cerkak_player"
+  ipcTarget: "cerkak_player"
   manageIpc: false
 
   property var anchorItem: null
@@ -204,7 +204,7 @@ Panel {
   }
 
   FileView {
-    path: Quickshell.env("XDG_RUNTIME_DIR") + "/cerkak_sprasojo/status.json"
+    path: Quickshell.env("XDG_RUNTIME_DIR") + "/cerkak_player/status.json"
     watchChanges: true
     printErrors: false
     onLoaded: root.applyStatus(text())

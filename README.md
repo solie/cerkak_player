@@ -64,16 +64,16 @@ cerkak-player refresh           # Re-fetch current playlist from YouTube
 You can control the plugin via `omarchy-shell`:
 
 ```bash
-omarchy-shell cerkak_sprasojo open
-omarchy-shell cerkak_sprasojo close
-omarchy-shell cerkak_sprasojo toggle
-omarchy-shell cerkak_sprasojo play
-omarchy-shell cerkak_sprasojo pause
-omarchy-shell cerkak_sprasojo next
-omarchy-shell cerkak_sprasojo prev
-omarchy-shell cerkak_sprasojo stop
-omarchy-shell cerkak_sprasojo shuffle
-omarchy-shell cerkak_sprasojo status
+omarchy-shell cerkak_player open
+omarchy-shell cerkak_player close
+omarchy-shell cerkak_player toggle
+omarchy-shell cerkak_player play
+omarchy-shell cerkak_player pause
+omarchy-shell cerkak_player next
+omarchy-shell cerkak_player prev
+omarchy-shell cerkak_player stop
+omarchy-shell cerkak_player shuffle
+omarchy-shell cerkak_player status
 ```
 
 ## Installation & Enablement
