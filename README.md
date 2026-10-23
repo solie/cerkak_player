@@ -78,11 +78,27 @@ omarchy-shell cerkak_player status
 
 ## Installation & Enablement
 
+Requirements: `mpv` and a current `yt-dlp`. YouTube regularly changes its
+stream formats, and a yt-dlp older than roughly three months starts returning
+HTTP 403. The player prefers `~/.local/bin/yt-dlp` over the system package, so
+the latest release can be installed without touching pacman:
+
+```bash
+mkdir -p ~/.local/bin
+curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+  -o ~/.local/bin/yt-dlp
+chmod +x ~/.local/bin/yt-dlp
+```
+
 ```bash
 # Plugin is installed at ~/.config/omarchy/plugins/cerkak_player
 omarchy plugin validate ~/.config/omarchy/plugins/cerkak_player
 omarchy plugin enable cerkak_player --section right
 ```
+
+Playback progress is only reported once mpv has actually loaded the stream;
+a refused stream shows an error in the panel and bar tooltip instead of a
+false "playing" state.
 
 ## Playlist Recommendation
 - https://youtube.com/playlist?list=PLKwjOjRtM0fSnn8yUlyyShLsEtzIOeynK&si=t2QSS4U5neNYuV3q by Radio Siaran Jawi

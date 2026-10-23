@@ -35,6 +35,8 @@ Panel {
 
   readonly property bool isPlaying: playerState && playerState.playing === true
   readonly property bool isPaused: playerState && playerState.paused === true
+  readonly property bool isLoading: playerState && playerState.loading === true
+  readonly property string playerError: playerState && playerState.error ? String(playerState.error) : ""
   readonly property int currentIndex: playerState && playerState.index !== undefined ? playerState.index : 0
   readonly property string currentTitle: playerState && playerState.title ? playerState.title : "Cerkak Basa Jawa"
   readonly property string currentFullTitle: playerState && playerState.fullTitle ? playerState.fullTitle : ""
@@ -329,10 +331,16 @@ Panel {
             }
 
             Text {
-              text: root.isPlaying
-                ? ((root.isPaused ? "Ngaso: " : "Memutar: ") + root.currentTitle)
-                : ("Cerita Cekak Basa Jawa · " + root.currentReader)
-              color: root.isPlaying ? Color.accent : Style.normalBorderFor(root.contentForeground, Color.dim)
+              text: root.playerError !== ""
+                ? ("Gagal: " + root.playerError)
+                : root.isLoading
+                  ? ("Memuat: " + root.currentTitle)
+                  : root.isPlaying
+                    ? ((root.isPaused ? "Ngaso: " : "Memutar: ") + root.currentTitle)
+                    : ("Cerita Cekak Basa Jawa · " + root.currentReader)
+              color: root.playerError !== ""
+                ? "#f7768e"
+                : root.isPlaying ? Color.accent : Style.normalBorderFor(root.contentForeground, Color.dim)
               font.family: root.contentFontFamily
               font.pixelSize: Style.font.small
               elide: Text.ElideRight
@@ -394,12 +402,16 @@ Panel {
               Rectangle {
                 anchors.fill: parent
                 radius: Style.space(12)
-                color: root.isPlaying
-                  ? (root.isPaused ? Qt.rgba(1, 0.7, 0, 0.15) : Qt.rgba(0.2, 0.8, 0.3, 0.15))
-                  : Qt.rgba(1, 1, 1, 0.08)
-                border.color: root.isPlaying
-                  ? (root.isPaused ? Qt.rgba(1, 0.7, 0, 0.4) : Qt.rgba(0.2, 0.8, 0.3, 0.4))
-                  : Qt.rgba(1, 1, 1, 0.15)
+                color: root.isLoading
+                  ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.12)
+                  : root.isPlaying
+                    ? (root.isPaused ? Qt.rgba(1, 0.7, 0, 0.15) : Qt.rgba(0.2, 0.8, 0.3, 0.15))
+                    : Qt.rgba(1, 1, 1, 0.08)
+                border.color: root.isLoading
+                  ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.4)
+                  : root.isPlaying
+                    ? (root.isPaused ? Qt.rgba(1, 0.7, 0, 0.4) : Qt.rgba(0.2, 0.8, 0.3, 0.4))
+                    : Qt.rgba(1, 1, 1, 0.15)
                 border.width: 1
               }
 
@@ -410,16 +422,16 @@ Panel {
 
                 Text {
                   anchors.verticalCenter: parent.verticalCenter
-                  text: root.isPlaying ? (root.isPaused ? "󰐊" : "󰏤") : "󰐊"
-                  color: root.isPlaying ? (root.isPaused ? "#e0af68" : "#9ece6a") : root.contentForeground
+                  text: root.isLoading ? "󰔟" : (root.isPlaying ? (root.isPaused ? "󰐊" : "󰏤") : "󰐊")
+                  color: root.isLoading ? Color.accent : (root.isPlaying ? (root.isPaused ? "#e0af68" : "#9ece6a") : root.contentForeground)
                   font.family: root.contentFontFamily
                   font.pixelSize: Style.font.small
                 }
 
                 Text {
                   anchors.verticalCenter: parent.verticalCenter
-                  text: root.isPlaying ? (root.isPaused ? "Ngaso" : "Memutar") : "Putar"
-                  color: root.isPlaying ? (root.isPaused ? "#e0af68" : "#9ece6a") : root.contentForeground
+                  text: root.isLoading ? "Memuat" : (root.isPlaying ? (root.isPaused ? "Ngaso" : "Memutar") : "Putar")
+                  color: root.isLoading ? Color.accent : (root.isPlaying ? (root.isPaused ? "#e0af68" : "#9ece6a") : root.contentForeground)
                   font.family: root.contentFontFamily
                   font.pixelSize: Math.round(Style.font.small * 0.95)
                   font.bold: true
@@ -433,6 +445,18 @@ Panel {
               }
             }
           }
+        }
+
+        // Playback failures (blocked stream, missing yt-dlp) stay visible
+        // instead of leaving the panel looking like it is playing.
+        Text {
+          visible: root.playerError !== ""
+          width: parent.width
+          text: "Gagal: " + root.playerError
+          color: "#f7768e"
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.small
+          wrapMode: Text.WordWrap
         }
 
         // ==================== 2. NOW PLAYING CARD ====================

@@ -13,6 +13,7 @@ import fcntl
 import socket
 import select
 import random
+import shutil
 import signal
 import urllib.parse
 import subprocess
@@ -39,6 +40,28 @@ STATE_FILE = DATA_DIR / "state.json"
 def ensure_dirs():
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def find_ytdlp():
+    """Return the yt-dlp binary to use, preferring a user-installed copy.
+
+    Distro packages lag behind YouTube's format changes, and an outdated
+    yt-dlp resolves URLs that immediately answer 403. A copy in ~/.local/bin
+    can be updated on its own, so it wins over the system one.
+    """
+    user_local = Path.home() / ".local" / "bin" / "yt-dlp"
+    if user_local.exists() and os.access(user_local, os.X_OK):
+        return str(user_local)
+    found = shutil.which("yt-dlp")
+    return found or ""
+
+
+def ytdlp_path_hint():
+    """Message shown when YouTube refuses a stream because of an old yt-dlp."""
+    return (
+        "YouTube menolak unduhan (HTTP 403). Perbarui yt-dlp ke versi terbaru "
+        "(mis. unduh rilis terbaru ke ~/.local/bin/yt-dlp)."
+    )
 
 
 def format_duration(seconds):
@@ -132,10 +155,9 @@ class PlaylistManager:
             url = DEFAULT_PLAYLIST_URL
 
         # Resolve yt-dlp binary path
-        ytdl_bin = "yt-dlp"
-        user_local = Path.home() / ".local" / "bin" / "yt-dlp"
-        if user_local.exists() and os.access(user_local, os.X_OK):
-            ytdl_bin = str(user_local)
+        ytdl_bin = find_ytdlp()
+        if not ytdl_bin:
+            raise RuntimeError("yt-dlp tidak ditemukan")
 
         env = os.environ.copy()
         env["PATH"] = f"{Path.home()}/.local/bin:{env.get('PATH', '')}"
@@ -203,6 +225,7 @@ class Daemon:
         self.duration = 0.0
         self.volume = 75
         self.loading = False
+        self.load_started = 0.0
         self.error_msg = ""
         self.req_id = 1
 
@@ -275,6 +298,12 @@ class Daemon:
             "--force-window=no"
         ]
 
+        # mpv's ytdl_hook resolves YouTube URLs itself, so point it at the same
+        # yt-dlp the playlist fetcher uses instead of trusting PATH order.
+        ytdl_bin = find_ytdlp()
+        if ytdl_bin:
+            cmd.append(f"--script-opts=ytdl_hook-ytdl_path={ytdl_bin}")
+
         log_file = open(MPV_LOG, "w")
         self.mpv_proc = subprocess.Popen(
             cmd,
@@ -341,8 +370,12 @@ class Daemon:
         item = self.playlist_mgr.items[idx]
         url = item["url"]
 
+        # Playback is only reported as playing once mpv actually has the file.
+        # Until then the UI shows a loading state instead of pretending audio
+        # is running when a failed YouTube request produced silence.
         self.loading = True
-        self.is_playing = True
+        self.load_started = time.time()
+        self.is_playing = False
         self.is_paused = False
         self.position = 0.0
         self.duration = float(item.get("duration", 0))
@@ -369,13 +402,17 @@ class Daemon:
             self.emit_status()
             return True
 
+        # A load is already on its way; don't queue a second one.
+        if self.loading:
+            return True
+
         if not self.is_playing:
             return self.play_index(self.current_index)
 
         return True
 
     def pause(self):
-        if self.is_playing and not self.is_paused:
+        if (self.is_playing or self.loading) and not self.is_paused:
             self.send_mpv_cmd(["set_property", "pause", True])
             self.is_paused = True
             self.emit_status()
@@ -383,11 +420,11 @@ class Daemon:
         return False
 
     def play_pause(self):
-        if not self.is_playing:
-            return self.play_index(self.current_index)
         if self.is_paused:
             return self.play()
-        return self.pause()
+        if self.is_playing or self.loading:
+            return self.pause()
+        return self.play_index(self.current_index)
 
     def stop(self):
         if self.mpv_sock:
@@ -395,6 +432,7 @@ class Daemon:
         self.is_playing = False
         self.is_paused = False
         self.loading = False
+        self.error_msg = ""
         self.position = 0.0
         self.emit_status()
         return True
@@ -511,7 +549,7 @@ class Daemon:
             "running": True,
             "playing": self.is_playing,
             "paused": self.is_paused,
-            "idle": not self.is_playing,
+            "idle": not (self.is_playing or self.loading),
             "index": idx,
             "count": count,
             "id": item.get("id", ""),
@@ -549,6 +587,28 @@ class Daemon:
         except Exception:
             pass
 
+    def log_hint(self):
+        """Turn the tail of mpv's log into something a user can act on."""
+        try:
+            tail = "\n".join(MPV_LOG.read_text(errors="ignore").splitlines()[-60:])
+        except Exception:
+            return ""
+        if "403" in tail or "Forbidden" in tail:
+            return ytdlp_path_hint()
+        if "yt-dlp" in tail and "not found" in tail.lower():
+            return "yt-dlp tidak ditemukan. Pasang yt-dlp untuk memutar YouTube."
+        return ""
+
+    def fail_playback(self, message=""):
+        self.loading = False
+        self.is_playing = False
+        self.is_paused = False
+        self.position = 0.0
+        self.error_msg = self.log_hint() or message or (
+            "Tidak dapat memutar audio. Periksa koneksi internet atau perbarui yt-dlp."
+        )
+        self.emit_status()
+
     def handle_mpv_event(self, line):
         try:
             data = json.loads(line)
@@ -563,6 +623,8 @@ class Daemon:
             if prop == "time-pos" and val is not None:
                 self.position = float(val)
                 self.loading = False
+                if not self.is_paused:
+                    self.is_playing = True
             elif prop == "pause" and val is not None:
                 self.is_paused = bool(val)
             elif prop == "duration" and val is not None:
@@ -570,20 +632,25 @@ class Daemon:
             elif prop == "volume" and val is not None:
                 self.volume = int(val)
             elif prop == "idle-active" and val is not None:
-                if val and self.is_playing and not self.loading:
+                if val and not self.loading:
                     self.is_playing = False
+                    self.is_paused = False
         elif event == "file-loaded":
             self.loading = False
             self.is_playing = True
-            self.is_paused = False
+            self.emit_status()
         elif event == "end-file":
             reason = data.get("reason")
             if reason == "eof":
                 # Song finished naturally, go to next!
+                self.loading = False
                 self.next_track()
             elif reason == "error":
-                self.error_msg = data.get("error", "Playback error")
+                self.fail_playback()
+            elif reason == "quit":
+                self.loading = False
                 self.is_playing = False
+                self.is_paused = False
 
     def handle_client_cmd(self, req):
         action = req.get("action")
@@ -690,11 +757,22 @@ class Daemon:
 
         try:
             while self.running:
+                now = time.time()
+
                 # Check mpv process
                 if self.mpv_proc and self.mpv_proc.poll() is not None:
+                    was_active = self.is_playing or self.loading
                     self.mpv_sock = None
                     self.is_playing = False
                     self.is_paused = False
+                    self.loading = False
+                    if was_active:
+                        self.fail_playback("mpv berhenti")
+
+                # A load that never finishes (dead network, stuck resolver)
+                # must not leave the UI claiming to load forever.
+                if self.loading and self.load_started and now - self.load_started > 45:
+                    self.fail_playback("Waktu memuat habis")
 
                 read_sockets = [server_sock]
                 if self.mpv_sock:

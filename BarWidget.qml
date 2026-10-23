@@ -22,6 +22,8 @@ BarWidget {
   readonly property bool playerRunning: playerState && playerState.running === true
   readonly property bool isPlaying: playerState && playerState.playing === true
   readonly property bool isPaused: playerState && playerState.paused === true
+  readonly property bool isLoading: playerState && playerState.loading === true
+  readonly property string playerError: playerState && playerState.error ? String(playerState.error) : ""
   readonly property string storyTitle: playerState && playerState.title ? String(playerState.title).trim() : ""
   readonly property int playerVolume: playerState && playerState.volume !== undefined ? playerState.volume : 75
   readonly property bool shuffleEnabled: playerState && playerState.shuffle === true
@@ -104,8 +106,8 @@ BarWidget {
   }
 
   readonly property string displayText: {
-    if (vertical) return isPlaying ? (isPaused ? "󰏤" : "󰐊") : "󰗃"
-    if (!isPlaying) return "󰗃 Cerkak"
+    if (vertical) return isPlaying ? (isPaused ? "󰏤" : "󰐊") : (isLoading ? "󰔟" : "󰗃")
+    if (!isPlaying) return (isLoading ? "󰔟" : "󰗃") + " Cerkak"
     var icon = isPaused ? "󰏤" : "󰐊"
     var title = storyTitle ? storyTitle : "Cerkak"
     if (title.length > 20) {
@@ -115,7 +117,7 @@ BarWidget {
   }
 
   readonly property var verticalLines: vertical
-    ? [isPlaying ? (isPaused ? "󰏤" : "󰐊") : "󰗃", "CRK"]
+    ? [isPlaying ? (isPaused ? "󰏤" : "󰐊") : (isLoading ? "󰔟" : "󰗃"), "CRK"]
     : [displayText]
 
   implicitWidth: button.implicitWidth
@@ -210,7 +212,11 @@ BarWidget {
     verticalPadding: 8.75
     active: root.isPlaying && !root.isPaused
 
-    tooltipText: root.isPlaying
+    tooltipText: root.playerError !== ""
+      ? ("Cerkak Player\nGagal: " + root.playerError)
+      : root.isLoading
+      ? ("Cerkak Player\nMemuat: " + root.storyTitle)
+      : root.isPlaying
       ? ("Cerkak Player\n"
          + (root.isPaused ? "Ngaso (Paused): " : "Memutar (Playing): ") + root.storyTitle + "\n"
          + "Durasi: " + (root.playerState ? (root.playerState.positionFormatted + " / " + root.playerState.durationFormatted) : "") + " · Volume " + root.playerVolume + "%\n"
